@@ -1,0 +1,938 @@
+Powershell:
+$pkgPath = "C:\Users\$env:USERNAME\packages"
+mkdir $pkgPath
+cd $pkgPath
+python -m pip download yfinance --platform manylinux2014_x86_64 --python-version 310 --only-binary=:all: -d .
+snowsql -a YDPJJTT-GS81194 -u RICARDOKAZ -r ACCOUNTADMIN -w COMPUTE_WH -d STOCKS_DB -s YFINANCE_RAW --mfa-passcode 123456
+
+* SnowSQL * v1.4.5
+RICARDOKAZ#COMPUTE_WH@STOCKS_DB.YFINANCE_RAW>CREATE OR REPLACE STAGE MY_PACKAGE_STAGE;
+
+RICARDOKAZ#COMPUTE_WH@STOCKS_DB.YFINANCE_RAW>PUT file://C:/Users/riper/*.whl @MY_PACKAGE_STAGE AUTO_COMPRESS=FALSE;
+
+RICARDOKAZ#COMPUTE_WH@STOCKS_DB.YFINANCE_RAW>LIST @MY_PACKAGE_STAGE;
+
+#-------------------------------------------------------- Snowflake SQL
+CREATE OR REPLACE NETWORK RULE yahoo_finance_network_rule
+  MODE = EGRESS
+  TYPE = HOST_PORT
+  VALUE_LIST = ('fc.yahoo.com:443', 'query1.finance.yahoo.com:443', 'query2.finance.yahoo.com:443');
+
+CREATE OR REPLACE EXTERNAL ACCESS INTEGRATION yahoo_finance_access_integration
+  ALLOWED_NETWORK_RULES = (yahoo_finance_network_rule)
+  ENABLED = TRUE;
+
+GRANT USAGE ON INTEGRATION yahoo_finance_access_integration TO ROLE ACCOUNTADMIN;
+
+-- Check that it was created
+SHOW INTEGRATIONS;
+
+-- Describe it
+DESC INTEGRATION yahoo_finance_access_integration;
+
+
+# <-------------------------------------------------------- Snowflake Python
+# <-------------------------------------------------------- Cell 1
+# Cell 1: Setup yfinance, fetch multi-ticker history (Magnificent 7), build 'quotes_df'
+from snowflake.snowpark.context import get_active_session
+import sys, os, zipfile, io, time
+from snowflake.snowpark.files import SnowflakeFile
+
+session = get_active_session()
+stage_path = "@MY_PACKAGE_STAGE"
+
+# --- Wheel bootstrap (your original approach preserved) ---
+wheel_files = [
+    "yfinance-1.1.0-py2.py3-none-any.whl", "multitasking-0.0.11-py3-none-any.whl",
+    "pandas-2.3.2-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+    "numpy-2.2.6-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+    "requests-2.32.5-py3-none-any.whl", "beautifulsoup4-4.14.3-py3-none-any.whl",
+    "peewee-3.19.0-py3-none-any.whl",
+    "frozendict-2.4.7-cp310-cp310-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+    "python_dateutil-2.9.0.post0-py2.py3-none-any.whl", "pytz-2025.2-py2.py3-none-any.whl",
+    "urllib3-2.6.3-py3-none-any.whl", "certifi-2026.1.4-py3-none-any.whl",
+    "charset_normalizer-3.4.4-cp310-cp310-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+    "idna-3.11-py3-none-any.whl", "soupsieve-2.8.3-py3-none-any.whl",
+    "six-1.17.0-py2.py3-none-any.whl", "typing_extensions-4.15.0-py3-none-any.whl",
+    "platformdirs-4.5.1-py3-none-any.whl", "tzdata-2025.3-py2.py3-none-any.whl",
+    "websockets-16.0-cp310-cp310-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl",
+    "protobuf-6.33.4-py39-abi3-manylinux2014_x86_64.whl"
+]
+
+temp_dir = "/tmp/wheels"; os.makedirs(temp_dir, exist_ok=True)
+for wheel_file in wheel_files:
+    try:
+        with SnowflakeFile.open(f"{stage_path}/{wheel_file}", 'rb') as f:
+            with zipfile.ZipFile(io.BytesIO(f.read()), 'r') as z:
+                z.extractall(temp_dir)
+    except:
+        pass
+sys.path.insert(0, temp_dir)
+
+# --- yfinance compatibility patch (as before) ---
+import requests as standard_requests
+if not hasattr(standard_requests.exceptions, 'DNSError'):
+    class DNSError(standard_requests.exceptions.ConnectionError): pass
+    standard_requests.exceptions.DNSError = DNSError
+
+import types
+class CompatSession(standard_requests.Session):
+    def __init__(self, *args, **kwargs):
+        kwargs.pop('impersonate', None)
+        super().__init__(*args, **kwargs)
+        self.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
+curl_cffi_requests = types.ModuleType('curl_cffi.requests')
+curl_cffi_requests.Session = CompatSession
+curl_cffi_requests.get = standard_requests.get
+curl_cffi_requests.post = standard_requests.post
+curl_cffi_requests.Response = standard_requests.Response
+curl_cffi_requests.exceptions = standard_requests.exceptions
+curl_cffi_requests.cookies = standard_requests.cookies
+curl_cffi_requests.session = types.ModuleType('session')
+curl_cffi_requests.session.Session = CompatSession
+sys.modules['curl_cffi'] = types.ModuleType('curl_cffi')
+sys.modules['curl_cffi'].requests = curl_cffi_requests
+sys.modules['curl_cffi.requests'] = curl_cffi_requests
+sys.modules['curl_cffi.requests.session'] = curl_cffi_requests.session
+sys.modules['curl_cffi.requests.cookies'] = curl_cffi_requests.cookies
+
+import yfinance as yf, yfinance.data as yf_data
+original_save_cookie = yf_data.YfData._save_cookie_curlCffi
+def patched_save_cookie_curlCffi(self):
+    try:
+        return original_save_cookie(self)
+    except AttributeError as e:
+        if 'jar' in str(e):
+            self._cookie = None
+            for cookie in self._session.cookies:
+                if cookie.name == 'A3':
+                    self._cookie = cookie.value
+                    break
+            return self._cookie is not None
+        else:
+            raise
+yf_data.YfData._save_cookie_curlCffi = patched_save_cookie_curlCffi
+
+print("✅ yfinance setup complete! Waiting 30 seconds to avoid rate limits...")
+time.sleep(30)
+
+# ---------- Fetch the Magnificent 7 ----------
+import pandas as pd
+symbols = ["AAPL", "MSFT", "AMZN", "GOOGL", "META", "NVDA", "TSLA"]  # edit freely
+
+frames = []
+for sym in symbols:
+    try:
+        t = yf.Ticker(sym)
+        hist = t.history(period="max", actions=True)
+        if hist is None or hist.empty:
+            print(f"⚠️ No data for {sym}")
+            continue
+        hist = hist.reset_index()  # bring Date out of index
+        hist["SYMBOL"] = sym
+        frames.append(hist)
+        print(f"  • {sym}: {len(hist):,} rows")
+    except Exception as ex:
+        print(f"⚠️ Error fetching {sym}: {ex}")
+
+if not frames:
+    raise RuntimeError("No data retrieved.")
+
+df = pd.concat(frames, ignore_index=True)
+
+# Standardize columns and dtypes now (so Cell 2 can be very lean)
+pdf = (df.rename(columns={
+    "Date":"DATE","Open":"OPEN","High":"HIGH","Low":"LOW","Close":"CLOSE",
+    "Volume":"VOLUME","Dividends":"DIVIDENDS","Stock Splits":"STOCK_SPLITS"
+}))[["SYMBOL","DATE","OPEN","HIGH","LOW","CLOSE","VOLUME","DIVIDENDS","STOCK_SPLITS"]]
+
+# Ensure tz-naive and numeric types
+pdf["DATE"] = pd.to_datetime(pdf["DATE"], errors="coerce")
+if getattr(pdf["DATE"].dtype, "tz", None) is not None:
+    pdf["DATE"] = pdf["DATE"].dt.tz_localize(None)
+
+for c in ["OPEN","HIGH","LOW","CLOSE","DIVIDENDS","STOCK_SPLITS"]:
+    pdf[c] = pd.to_numeric(pdf[c], errors="coerce")
+pdf["VOLUME"] = pd.to_numeric(pdf["VOLUME"], errors="coerce").fillna(0).astype("int64")
+pdf["DIVIDENDS"] = pdf["DIVIDENDS"].fillna(0.0)
+pdf["STOCK_SPLITS"] = pdf["STOCK_SPLITS"].fillna(0.0)
+pdf["SYMBOL"] = pdf["SYMBOL"].astype(str)
+
+# Keep for Cell 2
+global quotes_df
+quotes_df = pdf.sort_values(["SYMBOL","DATE"]).reset_index(drop=True)
+
+first_date = quotes_df["DATE"].min().date()
+last_date = quotes_df["DATE"].max().date()
+print(f"✅ Combined: {len(quotes_df):,} rows, {sorted(quotes_df['SYMBOL'].unique())}")
+print(f"   Range: {first_date} → {last_date}")
+
+
+
+# <-------------------------------------------------------- Cell 2
+# <--------------------------------------------------------
+# Cell 2: Upsert multi-ticker data into Snowflake efficiently + robust schema migration
+import pandas as pd, time
+
+DB = "STOCKS_DB"
+SCHEMA = "YFINANCE_RAW"
+TABLE = "TICKER_HISTORY"
+
+# On subsequent runs, stage only the recent window likely to change
+LOOKBACK_DAYS = 120
+
+def table_has_column(db, schema, table, column_name):
+    q = f"""
+        SELECT 1
+        FROM {db}.INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = '{schema.upper()}'
+          AND TABLE_NAME   = '{table.upper()}'
+          AND COLUMN_NAME  = '{column_name.upper()}'
+        LIMIT 1
+    """
+    try:
+        return len(session.sql(q).collect()) > 0
+    except Exception:
+        return False
+
+def ensure_columns(db, schema, table, expected_cols):
+    """
+    Make sure all columns exist on the target table.
+    expected_cols: list of (name, type_sql) tuples in desired order.
+    """
+    for col_name, col_type in expected_cols:
+        if not table_has_column(db, schema, table, col_name):
+            session.sql(f"ALTER TABLE {db}.{schema}.{table} ADD COLUMN {col_name} {col_type}").collect()
+            print(f"ℹ️ Migration: added {col_name} column to existing table.")
+
+try:
+    # Favor NTZ mapping for Arrow writes
+    session.sql("ALTER SESSION SET TIMESTAMP_TYPE_MAPPING = 'TIMESTAMP_NTZ'").collect()
+
+    # 1) Ensure schema/table exist (initial structure for multi-ticker)
+    session.sql(f"CREATE SCHEMA IF NOT EXISTS {DB}.{SCHEMA}").collect()
+    session.sql(f"""
+        CREATE TABLE IF NOT EXISTS {DB}.{SCHEMA}.{TABLE} (
+            SYMBOL STRING,
+            DATE   TIMESTAMP_NTZ,
+            OPEN   FLOAT,
+            HIGH   FLOAT,
+            LOW    FLOAT,
+            CLOSE  FLOAT,
+            VOLUME NUMBER,
+            DIVIDENDS FLOAT,
+            STOCK_SPLITS FLOAT,
+            ROW_HASH NUMBER
+        )
+    """).collect()
+
+    # 2) Ensure ALL expected columns exist (handles older single-ticker schemas)
+    expected_columns = [
+        ("SYMBOL", "STRING"),
+        ("DATE", "TIMESTAMP_NTZ"),
+        ("OPEN", "FLOAT"),
+        ("HIGH", "FLOAT"),
+        ("LOW", "FLOAT"),
+        ("CLOSE", "FLOAT"),
+        ("VOLUME", "NUMBER"),
+        ("DIVIDENDS", "FLOAT"),
+        ("STOCK_SPLITS", "FLOAT"),
+        ("ROW_HASH", "NUMBER")
+    ]
+    ensure_columns(DB, SCHEMA, TABLE, expected_columns)
+
+    # 3) Initial vs incremental run
+    exists_rows = 0
+    try:
+        res = session.sql(f"SELECT COUNT(*) AS C FROM {DB}.{SCHEMA}.{TABLE}").collect()
+        exists_rows = int(res[0]['C'])
+    except Exception:
+        exists_rows = 0
+
+    if exists_rows == 0:
+        stage_df = quotes_df.copy()
+        print("ℹ️ Initial load detected → staging full dataset.")
+    else:
+        max_date = quotes_df["DATE"].max()
+        cutoff = max_date - pd.Timedelta(days=LOOKBACK_DAYS)
+        stage_df = quotes_df[quotes_df["DATE"] >= cutoff].copy()
+        print(f"ℹ️ Incremental run → staging rows since {cutoff.date()} "
+              f"({len(stage_df):,} of {len(quotes_df):,})")
+
+    # 4) Create a TEMP staging table (types fixed; no surprises)
+    temp_table = f"TMP_TICKER_LOAD_{int(time.time())}"
+    session.sql(f"""
+        CREATE OR REPLACE TEMP TABLE {DB}.{SCHEMA}.{temp_table} (
+            SYMBOL STRING,
+            DATE   TIMESTAMP_NTZ,
+            OPEN   FLOAT,
+            HIGH   FLOAT,
+            LOW    FLOAT,
+            CLOSE  FLOAT,
+            VOLUME NUMBER,
+            DIVIDENDS FLOAT,
+            STOCK_SPLITS FLOAT
+        )
+    """).collect()
+
+    # 5) Write to temp (unqualified table_name with both database & schema)
+    session.write_pandas(
+    stage_df[["SYMBOL","DATE","OPEN","HIGH","LOW","CLOSE","VOLUME","DIVIDENDS","STOCK_SPLITS"]].reset_index(drop=True),
+    table_name=temp_table, database=DB, schema=SCHEMA,
+    auto_create_table=False, overwrite=True, use_logical_type=True, quote_identifiers=False
+)
+
+    # 6) Migration backfills (run only if the target already had rows)
+    if exists_rows > 0:
+        # Backfill SYMBOL for any legacy rows that might still be NULL, by joining on DATE
+        session.sql(f"""
+            UPDATE {DB}.{SCHEMA}.{TABLE} t
+            SET t.SYMBOL = s.SYMBOL
+            FROM {DB}.{SCHEMA}.{temp_table} s
+            WHERE t.SYMBOL IS NULL
+              AND t.DATE = s.DATE
+        """).collect()
+
+        # Backfill ROW_HASH where missing (use NVL to keep hash stable with NULLs)
+        session.sql(f"""
+            UPDATE {DB}.{SCHEMA}.{TABLE}
+            SET ROW_HASH = HASH(
+                SYMBOL,
+                DATE,
+                NVL(OPEN, 0),
+                NVL(HIGH, 0),
+                NVL(LOW, 0),
+                NVL(CLOSE, 0),
+                NVL(VOLUME, 0),
+                NVL(DIVIDENDS, 0),
+                NVL(STOCK_SPLITS, 0)
+            )
+            WHERE ROW_HASH IS NULL
+        """).collect()
+
+    # 7) MERGE with ROW_HASH — update only when values changed
+    session.sql(f"""
+        MERGE INTO {DB}.{SCHEMA}.{TABLE} t
+        USING (
+            SELECT
+                SYMBOL,
+                DATE,
+                OPEN,
+                HIGH,
+                LOW,
+                CLOSE,
+                VOLUME,
+                DIVIDENDS,
+                STOCK_SPLITS,
+                HASH(
+                    SYMBOL,
+                    DATE,
+                    NVL(OPEN, 0),
+                    NVL(HIGH, 0),
+                    NVL(LOW, 0),
+                    NVL(CLOSE, 0),
+                    NVL(VOLUME, 0),
+                    NVL(DIVIDENDS, 0),
+                    NVL(STOCK_SPLITS, 0)
+                ) AS ROW_HASH
+            FROM {DB}.{SCHEMA}.{temp_table}
+        ) s
+        ON t.SYMBOL = s.SYMBOL AND t.DATE = s.DATE
+        WHEN MATCHED AND NVL(t.ROW_HASH, 0) <> NVL(s.ROW_HASH, 0) THEN UPDATE SET
+            OPEN         = s.OPEN,
+            HIGH         = s.HIGH,
+            LOW          = s.LOW,
+            CLOSE        = s.CLOSE,
+            VOLUME       = s.VOLUME,
+            DIVIDENDS    = s.DIVIDENDS,
+            STOCK_SPLITS = s.STOCK_SPLITS,
+            ROW_HASH     = s.ROW_HASH
+        WHEN NOT MATCHED THEN INSERT (
+            SYMBOL, DATE, OPEN, HIGH, LOW, CLOSE, VOLUME, DIVIDENDS, STOCK_SPLITS, ROW_HASH
+        ) VALUES (
+            s.SYMBOL, s.DATE, s.OPEN, s.HIGH, s.LOW, s.CLOSE, s.VOLUME, s.DIVIDENDS, s.STOCK_SPLITS, s.ROW_HASH
+        )
+    """).collect()
+
+    # 8) Cleanup
+    session.sql(f"DROP TABLE IF EXISTS {DB}.{SCHEMA}.{temp_table}").collect()
+    print(f"✅ Upsert complete into {DB}.{SCHEMA}.{TABLE}")
+
+except NameError:
+    print("⚠️ Please run Cell 1 first (it must create 'quotes_df').")
+except Exception as e:
+    print(f"⚠️ Error saving to Snowflake: {e}")
+
+# <-------------------------------------------------------- Cell 3# <--------------------------------------------------------
+# Cell 3: Interactive SYMBOL dropdown (if ipywidgets available) + indicators + auto today() lookback
+import matplotlib.pyplot as plt
+import pandas as pd
+import numpy as np
+from snowflake.snowpark.functions import col
+
+# ---- Target table ----
+DB = "STOCKS_DB"
+SCHEMA = "YFINANCE_RAW"
+TABLE = "TICKER_HISTORY"
+
+# ---- Fallback controls (used only if ipywidgets is not available) ----
+symbols_from_cell1 = ["AAPL", "MSFT", "AMZN", "GOOGL", "META", "NVDA", "TSLA"]
+FALLBACK_SYMBOL = "MSFT"     # Change this if needed
+FALLBACK_LOOKBACK_DAYS = 365 # 90/180/365/730/etc.
+
+# -------------------- Helpers --------------------
+def to_naive(ts):
+    """Return a tz-naive Timestamp from anything datetime-like."""
+    t = pd.to_datetime(ts, errors="coerce")
+    return pd.Timestamp(t).tz_localize(None)
+
+def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute SMA/EMA/BB/RSI/MACD on df with columns: CLOSE, VOLUME."""
+    close = df["CLOSE"]
+
+    # SMAs
+    df["SMA_20"] = close.rolling(20, min_periods=20).mean()
+    df["SMA_50"] = close.rolling(50, min_periods=50).mean()
+    df["SMA_200"] = close.rolling(200, min_periods=200).mean()
+
+    # EMAs
+    df["EMA_12"] = close.ewm(span=12, adjust=False).mean()
+    df["EMA_26"] = close.ewm(span=26, adjust=False).mean()
+
+    # Bollinger Bands (20, 2σ)
+    bb_mid = close.rolling(20, min_periods=20).mean()
+    bb_std = close.rolling(20, min_periods=20).std()
+    df["BB_MID"] = bb_mid
+    df["BB_UPPER"] = bb_mid + 2 * bb_std
+    df["BB_LOWER"] = bb_mid - 2 * bb_std
+
+    # RSI (14) — Wilder
+    delta = close.diff()
+    gain = np.where(delta > 0, delta, 0.0)
+    loss = np.where(delta < 0, -delta, 0.0)
+    roll_up = pd.Series(gain, index=df.index).ewm(alpha=1/14, adjust=False).mean()
+    roll_down = pd.Series(loss, index=df.index).ewm(alpha=1/14, adjust=False).mean()
+    rs = roll_up / roll_down
+    df["RSI_14"] = 100 - (100 / (1.0 + rs))
+
+    # MACD (12,26,9)
+    macd = df["EMA_12"] - df["EMA_26"]
+    signal = macd.ewm(span=9, adjust=False).mean()
+    df["MACD"] = macd
+    df["MACD_SIGNAL"] = signal
+    df["MACD_HIST"] = macd - signal
+
+    return df
+
+def fetch_symbol_data(symbol: str) -> pd.DataFrame:
+    """Read one symbol from Snowflake and return tz-naive indexed DataFrame."""
+    sdf = session.table(f"{DB}.{SCHEMA}.{TABLE}") \
+                 .filter(col("SYMBOL") == symbol) \
+                 .sort(col("DATE"))
+    pdf = sdf.to_pandas()
+    if pdf.empty:
+        raise ValueError(f"No data found for {symbol}")
+
+    pdf["DATE"] = pd.to_datetime(pdf["DATE"], errors="coerce")
+    if getattr(pdf["DATE"].dtype, "tz", None) is not None:
+        pdf["DATE"] = pdf["DATE"].dt.tz_localize(None)
+    pdf.set_index("DATE", inplace=True)
+    return pdf
+
+def plot_symbol(symbol: str, lookback: str | int):
+    """Fetch selected symbol, compute indicators, and plot by lookback preset or days."""
+    pdf = fetch_symbol_data(symbol)
+
+    # Determine end date = today (tz-naive) capped to dataset max
+    today = to_naive(pd.Timestamp.today().normalize())
+    data_max = to_naive(pdf.index.max()).normalize()
+    end_date = min(today, data_max)
+
+    # Compute start date from lookback
+    lookback_map = {
+        "3M": 90, "6M": 180, "1Y": 365, "2Y": 730, "5Y": 1825, "10Y": 3650
+    }
+    if isinstance(lookback, str):
+        lb = lookback.upper()
+        if lb == "MAX":
+            start_date = pdf.index.min()
+        elif lb == "YTD":
+            start_date = pd.Timestamp(year=end_date.year, month=1, day=1)
+        elif lb in lookback_map:
+            start_date = end_date - pd.Timedelta(days=lookback_map[lb])
+        else:
+            # default to 1Y if unknown
+            start_date = end_date - pd.Timedelta(days=365)
+    else:
+        # numeric days
+        start_date = end_date - pd.Timedelta(days=int(lookback))
+
+    # Clamp to available data
+    start_date = max(start_date, pdf.index.min())
+    end_date = min(end_date, pdf.index.max())
+
+    # Compute indicators on full series, then slice view to keep windows correct
+    ind = compute_indicators(pdf.copy())
+    view = ind.loc[(ind.index >= start_date) & (ind.index <= end_date)].copy()
+
+    # ---- Plot (4 panels) ----
+    blue, green, red, grey = "#007AFF", "#34C759", "#FF3B30", "#8E8E93"
+    fig, axes = plt.subplots(4, 1, figsize=(15, 14), sharex=True)
+
+    # 1) Price + MAs + BB
+    ax1 = axes[0]
+    ax1.plot(view.index, view["CLOSE"], label="Close", color=blue, linewidth=1.4)
+    ax1.plot(view.index, view["SMA_20"], label="SMA 20", color="#9b59b6", linewidth=1)
+    ax1.plot(view.index, view["SMA_50"], label="SMA 50", color="#e67e22", linewidth=1)
+    ax1.plot(view.index, view["SMA_200"], label="SMA 200", color="#2c3e50", linewidth=1.1)
+    ax1.plot(view.index, view["EMA_12"], label="EMA 12", color="#16a085", linestyle="--", linewidth=1)
+    ax1.plot(view.index, view["EMA_26"], label="EMA 26", color="#c0392b", linestyle="--", linewidth=1)
+    ax1.plot(view.index, view["BB_UPPER"], color=grey, linewidth=0.8, alpha=0.9, label="BB Upper")
+    ax1.plot(view.index, view["BB_LOWER"], color=grey, linewidth=0.8, alpha=0.9, label="BB Lower")
+    ax1.fill_between(view.index, view["BB_LOWER"], view["BB_UPPER"], color=grey, alpha=0.12, label="BBand Range")
+    ax1.set_title(f"{symbol} – Price with SMAs, EMAs, and Bollinger Bands (from Snowflake)", fontsize=14, fontweight="bold")
+    ax1.set_ylabel("Price ($)")
+    ax1.grid(True, alpha=0.3)
+    ax1.legend(ncols=3, fontsize=9, frameon=False)
+
+    # 2) Volume
+    ax2 = axes[1]
+    color_vol = np.where(view["CLOSE"].diff() >= 0, green, red)
+    ax2.bar(view.index, view["VOLUME"], color=color_vol, width=1.0, alpha=0.6)
+    ax2.set_title("Volume", fontsize=12, fontweight="bold")
+    ax2.set_ylabel("Shares")
+    ax2.grid(True, alpha=0.3, axis="y")
+
+    # 3) RSI
+    ax3 = axes[2]
+    ax3.plot(view.index, view["RSI_14"], color="#6c5ce7", linewidth=1.2, label="RSI 14")
+    ax3.axhline(70, color=red, linestyle="--", linewidth=0.9)
+    ax3.axhline(30, color=green, linestyle="--", linewidth=0.9)
+    ax3.set_ylim(0, 100)
+    ax3.set_title("RSI (14)", fontsize=12, fontweight="bold")
+    ax3.set_ylabel("RSI")
+    ax3.grid(True, alpha=0.3)
+    ax3.legend(fontsize=9, frameon=False)
+
+    # 4) MACD
+    ax4 = axes[3]
+    ax4.plot(view.index, view["MACD"], color="#0984e3", linewidth=1.2, label="MACD")
+    ax4.plot(view.index, view["MACD_SIGNAL"], color="#d63031", linewidth=1.0, label="Signal (9)")
+    colors = np.where(view["MACD_HIST"] >= 0, green, red)
+    ax4.bar(view.index, view["MACD_HIST"], color=colors, alpha=0.5, width=1.0, label="Histogram")
+    ax4.set_title("MACD (12, 26, 9)", fontsize=12, fontweight="bold")
+    ax4.set_ylabel("MACD")
+    ax4.grid(True, alpha=0.3)
+    ax4.legend(fontsize=9, frameon=False)
+
+    plt.tight_layout()
+    plt.show()
+
+    # Summary
+    print(f"\n📊 {symbol} — Summary ({start_date.date()} → {end_date.date()}):")
+    print(f"Points: {len(view):,}")
+    if not view.empty:
+        print(f"Highest close: ${view['CLOSE'].max():.2f} on {view['CLOSE'].idxmax().date()}")
+        print(f"Lowest close:  ${view['CLOSE'].min():.2f} on {view['CLOSE'].idxmin().date()}")
+
+# -------------------- UI / Fallback --------------------
+try:
+    # 1) Get the available symbols from Snowflake
+    sym_rows = session.table(f"{DB}.{SCHEMA}.{TABLE}") \
+                      .select(col("SYMBOL")).distinct().sort(col("SYMBOL")).collect()
+    symbols = [r["SYMBOL"] for r in sym_rows]
+    if not symbols:
+        raise ValueError("No symbols found in the table. Did Cell 2 load data?")
+
+    # 2) Try ipywidgets dropdowns
+    try:
+        import ipywidgets as widgets
+        from IPython.display import display, clear_output
+
+        symbol_dd = widgets.Dropdown(
+            options=symbols,
+            value=symbols[0] if symbols else None,
+            description="Symbol",
+            layout=widgets.Layout(width="300px")
+        )
+        lookback_dd = widgets.Dropdown(
+            options=["3M", "6M", "1Y", "2Y", "5Y", "10Y", "YTD", "MAX"],
+            value="1Y",
+            description="Lookback",
+            layout=widgets.Layout(width="200px")
+        )
+        ui = widgets.HBox([symbol_dd, lookback_dd])
+
+        out = widgets.Output()
+
+        def on_change(*args):
+            with out:
+                out.clear_output(wait=True)
+                plot_symbol(symbol_dd.value, lookback_dd.value)
+
+        symbol_dd.observe(on_change, names="value")
+        lookback_dd.observe(on_change, names="value")
+
+        display(ui)
+        on_change()  # initial render
+        display(out)
+
+    except Exception as widget_err:
+        # Fallback when ipywidgets is not available
+        print("ℹ️ ipywidgets not available. Using fallback variables instead.")
+        print(f"Available symbols: {symbols}")
+        SYMBOL = FALLBACK_SYMBOL if FALLBACK_SYMBOL in symbols else symbols[0]
+        LOOKBACK_DAYS = int(FALLBACK_LOOKBACK_DAYS)
+
+        print(f"Using SYMBOL={SYMBOL}, LOOKBACK_DAYS={LOOKBACK_DAYS}")
+        plot_symbol(SYMBOL, LOOKBACK_DAYS)
+
+except Exception as e:
+    print(f"⚠️ Error reading/plotting from Snowflake: {e}")
+
+
+
+
+# <-------------------------------------------------------- Streamlit
+# streamlit_app.py — full replacement (brush-to-zoom with linked panels + Magnificent 7 correlation)
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import altair as alt
+from snowflake.snowpark.context import get_active_session
+from snowflake.snowpark.functions import col
+
+st.set_page_config(
+    page_title="Magnificent 7 – YFinance from Snowflake",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
+st.title("📊 Magnificent 7 – Snowflake-backed technicals")
+
+session = get_active_session()
+DB, SCHEMA, TABLE = "STOCKS_DB", "YFINANCE_RAW", "TICKER_HISTORY"
+
+# --- Controls data (symbols) ---
+symbols_rows = (
+    session.table(f"{DB}.{SCHEMA}.{TABLE}")
+    .select(col("SYMBOL"))
+    .distinct()
+    .sort(col("SYMBOL"))
+    .collect()
+)
+symbols = [r["SYMBOL"] for r in symbols_rows]
+if not symbols:
+    st.warning(
+        "No symbols found in table. Ensure your loader populated "
+        "STOCKS_DB.YFINANCE_RAW.TICKER_HISTORY."
+    )
+    st.stop()
+
+# --- Controls (inline, above the main chart) ---
+controls = st.container()
+with controls:
+    # Wider Period column to avoid truncation
+    c_sym, c_period, c_spacer = st.columns([2, 3, 5])
+    with c_sym:
+        symbol = st.selectbox("Symbol", symbols, index=0, key="symbol_select")
+    with c_period:
+        period = st.selectbox(
+            "Period",
+            ["3M", "6M", "1Y", "2Y", "5Y", "10Y", "YTD", "MAX"],
+            index=2,
+            key="period_select",
+        )
+
+# --- Query + prep (single-symbol) ---
+sdf = (
+    session.table(f"{DB}.{SCHEMA}.{TABLE}")
+    .filter(col("SYMBOL") == symbol)
+    .sort(col("DATE"))
+)
+pdf = sdf.to_pandas()
+if pdf.empty:
+    st.warning(f"No data for {symbol}")
+    st.stop()
+
+pdf["DATE"] = pd.to_datetime(pdf["DATE"], errors="coerce")
+if getattr(pdf["DATE"].dtype, "tz", None) is not None:
+    pdf["DATE"] = pdf["DATE"].dt.tz_localize(None)
+pdf.set_index("DATE", inplace=True)
+
+today = pd.Timestamp.today().normalize().tz_localize(None)
+data_max = pd.Timestamp(pdf.index.max()).tz_localize(None).normalize()
+end_date = min(today, data_max)
+
+map_days = {"3M": 90, "6M": 180, "1Y": 365, "2Y": 730, "5Y": 1825, "10Y": 3650}
+if period == "MAX":
+    start_date = pdf.index.min()
+elif period == "YTD":
+    start_date = pd.Timestamp(year=end_date.year, month=1, day=1)
+else:
+    start_date = end_date - pd.Timedelta(days=map_days[period])
+
+start_date = max(start_date, pdf.index.min())
+end_date = min(end_date, pdf.index.max())
+
+# --- Indicators on full series (then slice) ---
+df = pdf.copy()
+close = df["CLOSE"]
+
+# Moving averages
+df["SMA_20"] = close.rolling(20, min_periods=20).mean()
+df["SMA_50"] = close.rolling(50, min_periods=50).mean()
+df["SMA_200"] = close.rolling(200, min_periods=200).mean()
+
+# EMAs
+df["EMA_12"] = close.ewm(span=12, adjust=False).mean()
+df["EMA_26"] = close.ewm(span=26, adjust=False).mean()
+
+# Bollinger Bands
+bb_mid = close.rolling(20, min_periods=20).mean()
+bb_std = close.rolling(20, min_periods=20).std()
+df["BB_UPPER"] = bb_mid + 2 * bb_std
+df["BB_LOWER"] = bb_mid - 2 * bb_std
+
+# RSI (14)
+delta = close.diff()
+gain = np.where(delta > 0, delta, 0.0)
+loss = np.where(delta < 0, -delta, 0.0)
+roll_up = pd.Series(gain, index=df.index).ewm(alpha=1 / 14, adjust=False).mean()
+roll_down = pd.Series(loss, index=df.index).ewm(alpha=1 / 14, adjust=False).mean()
+rs = roll_up / roll_down
+df["RSI_14"] = 100 - (100 / (1.0 + rs))
+
+# MACD (12, 26, 9)
+macd = df["EMA_12"] - df["EMA_26"]
+signal = macd.ewm(span=9, adjust=False).mean()
+df["MACD"] = macd
+df["MACD_SIGNAL"] = signal
+df["MACD_HIST"] = macd - signal
+
+# Slice to selected window
+view = df.loc[(df.index >= start_date) & (df.index <= end_date)].copy()
+st.caption(f"{symbol}: {start_date.date()} → {end_date.date()}  •  Points: {len(view):,}")
+
+# Precompute reset-indexed DF for Altair
+vdf = view.reset_index()  # DATE becomes column
+
+# ------------------------------
+# Altair brush selection (drag to select period, zooms linked charts)
+# ------------------------------
+xbrush = alt.selection_interval(encodings=['x'])  # brushes only the X axis (time)
+
+# --- Layout ---
+c1, c2 = st.columns([3, 1])
+
+with c1:
+    # Base chart
+    base = alt.Chart(vdf).encode(
+        x=alt.X("DATE:T", axis=alt.Axis(title=None))
+    )
+
+    # Price + MAs + Bollinger Bands (detail view)
+    price = base.mark_line(color="#007AFF").encode(
+        y=alt.Y("CLOSE:Q", title="Price ($)")
+    )
+    sma20 = base.mark_line(color="#9b59b6").encode(y="SMA_20:Q")
+    sma50 = base.mark_line(color="#e67e22").encode(y="SMA_50:Q")
+    sma200 = base.mark_line(color="#2c3e50").encode(y="SMA_200:Q")
+
+    bb_area = (
+        alt.Chart(vdf)
+        .mark_area(color="#8E8E93", opacity=0.12)
+        .encode(x="DATE:T", y="BB_LOWER:Q", y2="BB_UPPER:Q")
+    )
+
+    detail = (price + sma20 + sma50 + sma200 + bb_area).properties(height=300)
+
+    # IMPORTANT: bind the X domain of the detail chart to the brush
+    detail = detail.encode(
+        x=alt.X(
+            "DATE:T",
+            scale=alt.Scale(domain=xbrush),  # <-- zooms to the brushed window
+            axis=alt.Axis(title=None),
+        )
+    )
+
+    # Navigator / overview (where you drag the brush)
+    navigator = (
+        alt.Chart(vdf)
+        .mark_area(color="#007AFF", opacity=0.25)
+        .encode(
+            x=alt.X("DATE:T", axis=alt.Axis(title=None)),
+            y=alt.Y("CLOSE:Q", title=None),
+        )
+        .add_selection(xbrush)  # <-- user drags here
+        .properties(height=60)
+    )
+
+    # Stack detail over navigator
+    st.altair_chart(
+        alt.vconcat(detail, navigator).resolve_scale(y='independent'),
+        use_container_width=True,
+    )
+
+    # MACD (linked to the same brush)
+    macd_base = alt.Chart(vdf).encode(
+        x=alt.X("DATE:T", scale=alt.Scale(domain=xbrush), axis=alt.Axis(title=None))
+    )
+    macd_line = macd_base.mark_line(color="#0984e3").encode(y="MACD:Q")
+    macd_sig  = macd_base.mark_line(color="#d63031").encode(y="MACD_SIGNAL:Q")
+    macd_hist = macd_base.mark_bar().encode(
+        y="MACD_HIST:Q",
+        color=alt.condition(alt.datum.MACD_HIST >= 0, alt.value("#34C759"), alt.value("#FF3B30")),
+    )
+    st.altair_chart(
+        (macd_line + macd_sig + macd_hist).properties(height=150),
+        use_container_width=True,
+    )
+
+with c2:
+    # Volume (linked to brush)
+    vol = (
+        alt.Chart(vdf)
+        .mark_bar(color="#34C759")
+        .encode(
+            x=alt.X("DATE:T", scale=alt.Scale(domain=xbrush), axis=alt.Axis(title=None)),
+            y=alt.Y("VOLUME:Q", title="Volume"),
+        )
+        .properties(height=180)
+    )
+    st.altair_chart(vol, use_container_width=True)
+
+    # RSI (linked to brush + rules)
+    rsi_chart = (
+        alt.Chart(vdf)
+        .mark_line(color="#6c5ce7")
+        .encode(
+            x=alt.X("DATE:T", scale=alt.Scale(domain=xbrush), axis=alt.Axis(title=None)),
+            y=alt.Y("RSI_14:Q", title="RSI"),
+        )
+    )
+    rsi_over = alt.Chart(pd.DataFrame({"y": [70]})).mark_rule(color="#FF3B30").encode(y='y:Q')
+    rsi_under = alt.Chart(pd.DataFrame({"y": [30]})).mark_rule(color="#34C759").encode(y='y:Q')
+
+    st.altair_chart(rsi_chart + rsi_over + rsi_under, use_container_width=True)
+
+# Optional data view
+with st.expander("Show raw data"):
+    st.dataframe(
+        view[
+            [
+                "SYMBOL",
+                "OPEN",
+                "HIGH",
+                "LOW",
+                "CLOSE",
+                "VOLUME",
+                "DIVIDENDS",
+                "STOCK_SPLITS",
+            ]
+        ],
+        use_container_width=True,
+    )
+
+# -------------------------------------------------------------
+# 🔗 Correlation – Magnificent 7 (AAPL, MSFT, GOOGL, AMZN, NVDA, META, TSLA)
+# -------------------------------------------------------------
+st.divider()
+st.subheader("🔗 Correlation – Magnificent 7 (daily returns)")
+
+M7_ALL = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA"]
+m7_available = [s for s in M7_ALL if s in symbols]
+missing = sorted(set(M7_ALL) - set(m7_available))
+if missing:
+    st.info(f"These symbols were not found in the table and will be skipped: {', '.join(missing)}")
+
+if len(m7_available) < 2:
+    st.warning("Not enough Magnificent 7 symbols available to compute a correlation matrix.")
+else:
+    # Pull all M7 rows (filter by date in pandas for consistency)
+    m7_sdf = (
+        session.table(f"{DB}.{SCHEMA}.{TABLE}")
+        .filter(col("SYMBOL").isin(m7_available))
+        .select(col("DATE"), col("SYMBOL"), col("CLOSE"))
+        .sort(col("DATE"), col("SYMBOL"))
+    )
+    m7_pdf = m7_sdf.to_pandas()
+
+    if m7_pdf.empty:
+        st.warning("No data found for Magnificent 7 symbols.")
+    else:
+        # Prepare
+        m7_pdf["DATE"] = pd.to_datetime(m7_pdf["DATE"], errors="coerce")
+        if getattr(m7_pdf["DATE"].dtype, "tz", None) is not None:
+            m7_pdf["DATE"] = m7_pdf["DATE"].dt.tz_localize(None)
+        m7_pdf = m7_pdf.dropna(subset=["DATE"])
+        m7_pdf = m7_pdf[(m7_pdf["DATE"] >= start_date) & (m7_pdf["DATE"] <= end_date)]
+
+        if m7_pdf.empty:
+            st.warning("No Magnificent 7 data in the selected window.")
+        else:
+            # Pivot to wide prices
+            prices_wide = (
+                m7_pdf.pivot(index="DATE", columns="SYMBOL", values="CLOSE")
+                .sort_index()
+            )
+
+            # Compute daily percent returns; keep only overlapping days
+            rets = prices_wide.pct_change().dropna(how="any")
+            rets = rets.dropna(axis=1, how="all")
+
+            if rets.shape[1] < 2:
+                st.warning("Not enough overlapping data among Magnificent 7 symbols to compute correlations.")
+            else:
+                corr = rets.corr()
+
+                st.caption(
+                    f"Window: {start_date.date()} → {end_date.date()}  •  Overlapping trading days: {len(rets):,}"
+                )
+
+                # ---- Robust long-form transform (fixes KeyError from melt) ----
+                corr_long = (
+                    corr.stack()
+                        .rename_axis(["SYMBOL_X", "SYMBOL_Y"])
+                        .reset_index(name="CORR")
+                )
+
+                # Determine consistent order for axes based on available columns
+                symbols_in_corr = list(corr.columns)
+                order = [s for s in M7_ALL if s in symbols_in_corr]
+                if len(order) != len(symbols_in_corr):
+                    # Append any remaining symbols that weren't in the predefined list
+                    order += [s for s in symbols_in_corr if s not in order]
+
+                base = alt.Chart(corr_long).encode(
+                    x=alt.X("SYMBOL_X:N", title=None, sort=order),
+                    y=alt.Y("SYMBOL_Y:N", title=None, sort=order),
+                )
+
+                heat = base.mark_rect().encode(
+                    color=alt.Color(
+                        "CORR:Q",
+                        scale=alt.Scale(scheme="redblue", domain=[-1, 1]),
+                        title="Correlation"
+                    ),
+                    tooltip=[
+                        alt.Tooltip("SYMBOL_X:N", title="Row"),
+                        alt.Tooltip("SYMBOL_Y:N", title="Col"),
+                        alt.Tooltip("CORR:Q", title="ρ", format=".2f"),
+                    ],
+                ).properties(height=300)
+
+                text = base.mark_text(baseline="middle").encode(
+                    text=alt.Text("CORR:Q", format=".2f"),
+                    color=alt.condition(
+                        "datum.CORR >= 0.5 || datum.CORR <= -0.5",
+                        alt.value("white"),
+                        alt.value("black"),
+                    )
+                )
+
+                st.altair_chart(heat + text, use_container_width=True)
+
+                # Tabular view
+                st.write("Correlation table")
+                st.dataframe(corr.round(2), use_container_width=True)
