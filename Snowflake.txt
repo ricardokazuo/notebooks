@@ -12,8 +12,25 @@ RICARDOKAZ#COMPUTE_WH@STOCKS_DB.YFINANCE_RAW>PUT file://C:/Users/riper/*.whl @MY
 
 RICARDOKAZ#COMPUTE_WH@STOCKS_DB.YFINANCE_RAW>LIST @MY_PACKAGE_STAGE;
 
+Snowflake SQL
+CREATE OR REPLACE NETWORK RULE yahoo_finance_network_rule
+  MODE = EGRESS
+  TYPE = HOST_PORT
+  VALUE_LIST = ('fc.yahoo.com:443', 'query1.finance.yahoo.com:443', 'query2.finance.yahoo.com:443');
 
+CREATE OR REPLACE EXTERNAL ACCESS INTEGRATION yahoo_finance_access_integration
+  ALLOWED_NETWORK_RULES = (yahoo_finance_network_rule)
+  ENABLED = TRUE;
 
+GRANT USAGE ON INTEGRATION yahoo_finance_access_integration TO ROLE ACCOUNTADMIN;
+
+-- Check that it was created
+SHOW INTEGRATIONS;
+
+-- Describe it
+DESC INTEGRATION yahoo_finance_access_integration;
+
+Snowflake Python
 # <--------------------------------------------------------
 # Cell 1: Setup yfinance and retrieve data
 from snowflake.snowpark.context import get_active_session
