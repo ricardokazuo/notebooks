@@ -1,0 +1,176 @@
+Powershell:
+$pkgPath = "C:\Users\$env:USERNAME\packages"
+mkdir $pkgPath
+cd $pkgPath
+python -m pip download yfinance --platform manylinux2014_x86_64 --python-version 310 --only-binary=:all: -d .
+snowsql -a YDPJJTT-GS81194 -u RICARDOKAZ -r ACCOUNTADMIN -w COMPUTE_WH -d STOCKS_DB -s YFINANCE_RAW --mfa-passcode 123456
+
+* SnowSQL * v1.4.5
+RICARDOKAZ#COMPUTE_WH@STOCKS_DB.YFINANCE_RAW>CREATE OR REPLACE STAGE MY_PACKAGE_STAGE;
+
+RICARDOKAZ#COMPUTE_WH@STOCKS_DB.YFINANCE_RAW>PUT file://C:/Users/riper/*.whl @MY_PACKAGE_STAGE AUTO_COMPRESS=FALSE;
+
+RICARDOKAZ#COMPUTE_WH@STOCKS_DB.YFINANCE_RAW>LIST @MY_PACKAGE_STAGE;
+
+
+
+# <--------------------------------------------------------
+# Cell 1: Setup yfinance and retrieve data
+from snowflake.snowpark.context import get_active_session
+import sys
+import os
+import zipfile
+import io
+import time
+from snowflake.snowpark.files import SnowflakeFile
+
+session = get_active_session()
+stage_path = "@MY_PACKAGE_STAGE"
+
+wheel_files = [
+    "yfinance-1.1.0-py2.py3-none-any.whl", "multitasking-0.0.11-py3-none-any.whl",
+    "pandas-2.3.2-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+    "numpy-2.2.6-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+    "requests-2.32.5-py3-none-any.whl", "beautifulsoup4-4.14.3-py3-none-any.whl",
+    "peewee-3.19.0-py3-none-any.whl",
+    "frozendict-2.4.7-cp310-cp310-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+    "python_dateutil-2.9.0.post0-py2.py3-none-any.whl", "pytz-2025.2-py2.py3-none-any.whl",
+    "urllib3-2.6.3-py3-none-any.whl", "certifi-2026.1.4-py3-none-any.whl",
+    "charset_normalizer-3.4.4-cp310-cp310-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+    "idna-3.11-py3-none-any.whl", "soupsieve-2.8.3-py3-none-any.whl",
+    "six-1.17.0-py2.py3-none-any.whl", "typing_extensions-4.15.0-py3-none-any.whl",
+    "platformdirs-4.5.1-py3-none-any.whl", "tzdata-2025.3-py2.py3-none-any.whl",
+    "websockets-16.0-cp310-cp310-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl",
+    "protobuf-6.33.4-cp39-abi3-manylinux2014_x86_64.whl"
+]
+
+temp_dir = "/tmp/wheels"
+os.makedirs(temp_dir, exist_ok=True)
+
+for wheel_file in wheel_files:
+    try:
+        with SnowflakeFile.open(f"{stage_path}/{wheel_file}", 'rb') as f:
+            with zipfile.ZipFile(io.BytesIO(f.read()), 'r') as z:
+                z.extractall(temp_dir)
+    except:
+        pass
+
+sys.path.insert(0, temp_dir)
+
+import requests as standard_requests
+
+if not hasattr(standard_requests.exceptions, 'DNSError'):
+    class DNSError(standard_requests.exceptions.ConnectionError):
+        pass
+    standard_requests.exceptions.DNSError = DNSError
+
+import types
+
+class CompatSession(standard_requests.Session):
+    def __init__(self, *args, **kwargs):
+        kwargs.pop('impersonate', None)
+        super().__init__(*args, **kwargs)
+        self.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        })
+
+curl_cffi_requests = types.ModuleType('curl_cffi.requests')
+curl_cffi_requests.Session = CompatSession
+curl_cffi_requests.get = standard_requests.get
+curl_cffi_requests.post = standard_requests.post
+curl_cffi_requests.Response = standard_requests.Response
+curl_cffi_requests.exceptions = standard_requests.exceptions
+curl_cffi_requests.cookies = standard_requests.cookies
+curl_cffi_requests.session = types.ModuleType('session')
+curl_cffi_requests.session.Session = CompatSession
+
+sys.modules['curl_cffi'] = types.ModuleType('curl_cffi')
+sys.modules['curl_cffi'].requests = curl_cffi_requests
+sys.modules['curl_cffi.requests'] = curl_cffi_requests
+sys.modules['curl_cffi.requests.session'] = curl_cffi_requests.session
+sys.modules['curl_cffi.requests.cookies'] = curl_cffi_requests.cookies
+
+import yfinance as yf
+import yfinance.data as yf_data
+
+original_save_cookie = yf_data.YfData._save_cookie_curlCffi
+
+def patched_save_cookie_curlCffi(self):
+    try:
+        return original_save_cookie(self)
+    except AttributeError as e:
+        if 'jar' in str(e):
+            self._cookie = None
+            for cookie in self._session.cookies:
+                if cookie.name == 'A3':
+                    self._cookie = cookie.value
+                    break
+            return self._cookie is not None
+        else:
+            raise
+
+yf_data.YfData._save_cookie_curlCffi = patched_save_cookie_curlCffi
+
+print("✅ yfinance setup complete!")
+print("\nWait 30 seconds before first request to avoid rate limits...")
+time.sleep(30)
+
+# Retrieve historical data
+try:
+    ticker = yf.Ticker("AAPL")
+    # Get full historical data (max available)
+    hist_data = ticker.history(period="max")
+    
+    print(f"\n✅ SUCCESS! Retrieved {len(hist_data)} data points for AAPL")
+    print(f"Date range: {hist_data.index.min()} to {hist_data.index.max()}")
+    print(f"\nFirst few rows:")
+    print(hist_data.head())
+    
+    # Store data for next cell
+    global aapl_data
+    aapl_data = hist_data
+    
+except Exception as e:
+    print(f"\n⚠️ Error retrieving data: {e}")
+    print("Wait a few minutes and try again.")
+	
+# <--------------------------------------------------------
+# Cell 2: Plot the entire historical series
+import matplotlib.pyplot as plt
+import pandas as pd
+
+# Use the data from the previous cell
+try:
+    # Create a comprehensive visualization
+    fig, axes = plt.subplots(2, 1, figsize=(15, 10))
+    
+    # Plot 1: Closing Price over time
+    axes[0].plot(aapl_data.index, aapl_data['Close'], linewidth=1, color='#007AFF')
+    axes[0].set_title('AAPL Historical Closing Price', fontsize=14, fontweight='bold')
+    axes[0].set_xlabel('Date', fontsize=12)
+    axes[0].set_ylabel('Price ($)', fontsize=12)
+    axes[0].grid(True, alpha=0.3)
+    axes[0].fill_between(aapl_data.index, aapl_data['Close'], alpha=0.2, color='#007AFF')
+    
+    # Plot 2: Trading Volume over time
+    axes[1].bar(aapl_data.index, aapl_data['Volume'], width=1, color='#34C759', alpha=0.6)
+    axes[1].set_title('AAPL Trading Volume', fontsize=14, fontweight='bold')
+    axes[1].set_xlabel('Date', fontsize=12)
+    axes[1].set_ylabel('Volume', fontsize=12)
+    axes[1].grid(True, alpha=0.3, axis='y')
+    
+    plt.tight_layout()
+    plt.show()
+    
+    # Print summary statistics
+    print("\n📊 Summary Statistics:")
+    print(f"Total trading days: {len(aapl_data)}")
+    print(f"Highest close: ${aapl_data['Close'].max():.2f} on {aapl_data['Close'].idxmax().strftime('%Y-%m-%d')}")
+    print(f"Lowest close: ${aapl_data['Close'].min():.2f} on {aapl_data['Close'].idxmin().strftime('%Y-%m-%d')}")
+    print(f"Current close: ${aapl_data['Close'].iloc[-1]:.2f}")
+    print(f"Total return: {((aapl_data['Close'].iloc[-1] / aapl_data['Close'].iloc[0] - 1) * 100):.2f}%")
+    
+except NameError:
+    print("⚠️ Please run Cell 1 first to load the data!")
+except Exception as e:
+    print(f"⚠️ Error plotting data: {e}")
